@@ -24,16 +24,51 @@ export async function resolveNodeImport(root: string, spec: string): Promise<str
   return resolveNodeImportInternal(op.join(root, ".observablehq", "cache", "_node"), root, spec);
 }
 
+export async function resolveNodeImportFrom(root: string, packageRoot: string, spec: string): Promise<string> {
+  return resolveNodeImportInternal(op.join(root, ".observablehq", "cache", "_node"), packageRoot, spec);
+}
+
 const bundlePromises = new Map<string, Promise<string>>();
 
 async function resolveNodeImportInternal(cacheRoot: string, packageRoot: string, spec: string): Promise<string> {
   const {name, path = "."} = parseNpmSpecifier(spec);
   const require = createRequire(pathToFileURL(op.join(packageRoot, "/")));
-  const pathResolution = require.resolve(spec);
-  const packageResolution = await packageDirectory({cwd: op.dirname(pathResolution)});
+  let pathResolution: string;
+  let packageResolution: string | undefined;
+  let entryPath = path;
+  let bundleInput = spec;
+  const preferParquetWasm = name === "parquet-wasm";
+  try {
+    pathResolution = require.resolve(spec);
+  } catch (error) {
+    if (path !== ".") throw error;
+    const packagePath = op.join(packageRoot, "node_modules", ...name.split("/"));
+    const pkgJsonPath = op.join(packagePath, "package.json");
+    if (!existsSync(pkgJsonPath)) throw error;
+    const pkg = JSON.parse(await readFile(pkgJsonPath, "utf-8"));
+    entryPath = pkg.module ?? pkg.main ?? "index.js";
+    if (!extname(entryPath)) entryPath = `${entryPath}.js`;
+    pathResolution = op.join(packagePath, entryPath);
+    packageResolution = packagePath;
+  }
+  if (!packageResolution) packageResolution = await packageDirectory({cwd: op.dirname(pathResolution)});
   if (!packageResolution) throw new Error(`unable to resolve package.json: ${spec}`);
+  if (preferParquetWasm) {
+    const preferred = resolveParquetWasmEntry(packageResolution);
+    if (
+      preferred &&
+      preferred !== entryPath &&
+      !entryPath.startsWith("esm/") &&
+      !entryPath.startsWith("esm2/")
+    ) {
+      entryPath = preferred;
+      pathResolution = op.join(packageResolution, entryPath);
+      bundleInput = pathResolution;
+    }
+  }
   const {version} = JSON.parse(await readFile(op.join(packageResolution, "package.json"), "utf-8"));
-  const resolution = `${name}@${version}/${extname(path) ? path : path === "." ? "index.js" : `${path}.js`}`;
+  const resolvedPath = extname(entryPath) ? entryPath : entryPath === "." ? "index.js" : `${entryPath}.js`;
+  const resolution = `${name}@${version}/${resolvedPath}`;
   const outputPath = op.join(cacheRoot, toOsPath(resolution));
   const resolutionPath = `/_node/${resolution}`;
   if (existsSync(outputPath)) return resolutionPath;
@@ -43,7 +78,11 @@ async function resolveNodeImportInternal(cacheRoot: string, packageRoot: string,
     console.log(`${spec} ${faint("→")} ${outputPath}`);
     await prepareOutput(outputPath);
     if (isJavaScript(pathResolution)) {
-      await writeFile(outputPath, await bundle(resolutionPath, spec, require, cacheRoot, packageResolution), "utf-8");
+      await writeFile(
+        outputPath,
+        await bundle(resolutionPath, bundleInput, require, cacheRoot, packageResolution),
+        "utf-8"
+      );
     } else {
       await copyFile(pathResolution, outputPath);
     }
@@ -52,6 +91,16 @@ async function resolveNodeImportInternal(cacheRoot: string, packageRoot: string,
   promise.catch(console.error).then(() => bundlePromises.delete(outputPath));
   bundlePromises.set(outputPath, promise);
   return promise;
+}
+
+function resolveParquetWasmEntry(packageResolution: string): string | null {
+  const parquetEntry = op.join(packageResolution, "esm", "parquet_wasm.js");
+  if (existsSync(parquetEntry)) return "esm/parquet_wasm.js";
+  const arrowEntry = op.join(packageResolution, "esm", "arrow2.js");
+  if (existsSync(arrowEntry)) return "esm/arrow2.js";
+  const esm2ArrowEntry = op.join(packageResolution, "esm2", "arrow2.js");
+  if (existsSync(esm2ArrowEntry)) return "esm2/arrow2.js";
+  return null;
 }
 
 /**
